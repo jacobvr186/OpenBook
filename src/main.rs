@@ -100,12 +100,6 @@ impl ProfilingStats {
         field.fetch_add(micros, Ordering::Relaxed);
         count_field.fetch_add(1, Ordering::Relaxed);
     }
-    
-    fn get_avg(&self, field: &AtomicU64, count_field: &AtomicU64) -> f64 {
-        let total = field.load(Ordering::Relaxed);
-        let count = count_field.load(Ordering::Relaxed);
-        if count == 0 { 0.0 } else { total as f64 / count as f64 }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -344,7 +338,7 @@ const ASK_COLOR: Color = Color::Rgb(180, 0, 0);
 const ASK_BRIGHT: Color = Color::Rgb(255, 50, 50);
 const ASK_DIM: Color = Color::Rgb(80, 0, 0);
 const HEADER_COLOR: Color = Color::Yellow;
-const ACCENT_COLOR: Color = Color::Cyan;
+
 
 fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats, trade_history: &TradeHistory) {
     let agg_start = Instant::now();
@@ -410,8 +404,7 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats, trade_
             Constraint::Min(12),     // Order book
             Constraint::Length(2),   // Summary
             Constraint::Length(1),   // Update ID
-            Constraint::Length(10),  // Price chart
-            Constraint::Length(11),  // Profiling
+            Constraint::Min(8),      // Price chart (expanded)
             Constraint::Length(1),   // Footer
         ])
         .split(f.area());
@@ -559,9 +552,6 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats, trade_
     // Price chart with trade bubbles
     render_price_chart(f, chunks[6], trade_history);
     
-    // Profiling stats
-    render_profiling(f, chunks[7], stats, app.render_time_us);
-    
     // Footer
     let footer = Paragraph::new(format!(
         "Book size: {} bids, {} asks │ Press 'q' or Ctrl+C to exit",
@@ -569,7 +559,7 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats, trade_
     ))
     .style(Style::default().fg(Color::DarkGray))
     .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(footer, chunks[8]);
+    f.render_widget(footer, chunks[7]);
 }
 
 fn render_bids(f: &mut Frame, area: Rect, bids: &[(f64, f64)], cumulative: &[f64], max_cumulative: f64) {
@@ -755,23 +745,9 @@ fn render_price_chart(f: &mut Frame, area: Rect, trade_history: &TradeHistory) {
     let inner = chart_block.inner(area);
     f.render_widget(chart_block, area);
     
-    // Reserve space for Y-axis (8 chars) and X-axis (1 row)
-    let y_axis_width: u16 = 10;
-    let x_axis_height: u16 = 1;
-    
-    if inner.width < y_axis_width + 20 || inner.height < x_axis_height + 3 {
+    if inner.width < 30 || inner.height < 6 {
         return; // Too small to render
     }
-    
-    let chart_area = Rect::new(
-        inner.x + y_axis_width,
-        inner.y,
-        inner.width - y_axis_width,
-        inner.height - x_axis_height,
-    );
-    
-    let chart_width = chart_area.width as usize;
-    let chart_height = chart_area.height as usize;
     
     // Get current time
     let now_ms = std::time::SystemTime::now()
@@ -783,7 +759,7 @@ fn render_price_chart(f: &mut Frame, area: Rect, trade_history: &TradeHistory) {
     let window_ms = trade_history.window_ms;
     let time_start = now_ms.saturating_sub(window_ms);
     
-    // Filter trades in window and find price range
+    // Filter trades in window
     let trades_in_window: Vec<&Trade> = trade_history.trades.iter()
         .filter(|t| t.timestamp_ms >= time_start)
         .collect();
@@ -792,73 +768,99 @@ fn render_price_chart(f: &mut Frame, area: Rect, trade_history: &TradeHistory) {
         let no_data = Paragraph::new("Waiting for trades...")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(ratatui::layout::Alignment::Center);
-        f.render_widget(no_data, chart_area);
+        f.render_widget(no_data, inner);
         return;
     }
     
+    // Layout: Y-axis | Price chart | Volume bars | X-axis
+    let y_axis_width: u16 = 11;
+    let volume_height: u16 = 3;  // Volume bar area
+    let x_axis_height: u16 = 1;
+    
+    let price_chart_height = inner.height.saturating_sub(volume_height + x_axis_height);
+    if price_chart_height < 3 {
+        return;
+    }
+    
+    let chart_width = (inner.width - y_axis_width) as usize;
+    let chart_height = price_chart_height as usize;
+    
+    // Find price range from trades
     let min_price = trades_in_window.iter().map(|t| t.price).fold(f64::MAX, |a, b| a.min(b));
     let max_price = trades_in_window.iter().map(|t| t.price).fold(f64::MIN, |a, b| a.max(b));
     
-    // Add padding to price range
+    // Dynamic padding based on price volatility
     let price_range = max_price - min_price;
-    let padding = if price_range > 0.0 { price_range * 0.15 } else { max_price * 0.001 };
+    let padding = if price_range > 0.0 { 
+        price_range * 0.2  // 20% padding for better visibility
+    } else { 
+        max_price * 0.0005  // Minimal padding if flat
+    };
     let min_price = min_price - padding;
     let max_price = max_price + padding;
     let price_range = max_price - min_price;
     
-    // Create a 2D grid for the chart
+    // Create price chart grid
     let mut grid: Vec<Vec<(char, Color)>> = vec![vec![(' ', Color::Reset); chart_width]; chart_height];
     
-    // Build price line from trades (using last traded price)
-    // Group trades by X position and take the last price for each
-    let mut price_by_x: Vec<Option<f64>> = vec![None; chart_width];
+    // Create volume data per column
+    let mut buy_volume: Vec<f64> = vec![0.0; chart_width];
+    let mut sell_volume: Vec<f64> = vec![0.0; chart_width];
+    let mut price_at_x: Vec<Option<f64>> = vec![None; chart_width];
     
+    // Aggregate trades by X position
     for trade in &trades_in_window {
         let x = ((trade.timestamp_ms - time_start) as f64 / window_ms as f64 * (chart_width - 1) as f64) as usize;
         let x = x.min(chart_width - 1);
-        price_by_x[x] = Some(trade.price);
+        
+        if trade.is_buy {
+            buy_volume[x] += trade.quantity;
+        } else {
+            sell_volume[x] += trade.quantity;
+        }
+        price_at_x[x] = Some(trade.price);  // Last price at this x
     }
     
-    // Fill gaps with previous price (forward fill)
+    // Find max volume for scaling
+    let max_volume = buy_volume.iter().chain(sell_volume.iter()).fold(0.0f64, |a, &b| a.max(b));
+    
+    // Forward fill prices for continuous line
     let mut last_price: Option<f64> = None;
     for i in 0..chart_width {
-        if price_by_x[i].is_some() {
-            last_price = price_by_x[i];
-        } else if last_price.is_some() {
-            price_by_x[i] = last_price;
+        if price_at_x[i].is_some() {
+            last_price = price_at_x[i];
+        } else {
+            price_at_x[i] = last_price;
         }
     }
     
-    // Draw price line
+    // Draw price line with proper connecting characters
     let mut prev_y: Option<usize> = None;
-    for (x, price_opt) in price_by_x.iter().enumerate() {
+    for (x, price_opt) in price_at_x.iter().enumerate() {
         if let Some(price) = price_opt {
             let y = ((max_price - price) / price_range * (chart_height - 1) as f64) as usize;
             let y = y.min(chart_height - 1);
             
-            // Connect to previous point
+            // Connect to previous point with vertical line if Y changed
             if let Some(py) = prev_y {
                 if py != y {
                     let (y_start, y_end) = if py < y { (py, y) } else { (y, py) };
                     for yy in y_start..=y_end {
-                        if grid[yy][x].0 == ' ' {
-                            grid[yy][x] = ('│', Color::Cyan);
+                        let ch = if yy == y_start || yy == y_end { '│' } else { '│' };
+                        if grid[yy][x].0 == ' ' || grid[yy][x].0 == '─' {
+                            grid[yy][x] = (ch, Color::Yellow);
                         }
                     }
                 }
             }
             
-            grid[y][x] = ('─', Color::Cyan);
+            // Draw horizontal line segment
+            grid[y][x] = ('━', Color::Yellow);
             prev_y = Some(y);
         }
     }
     
-    // Find max trade quantity for intensity scaling
-    let max_qty = trades_in_window.iter()
-        .map(|t| t.quantity)
-        .fold(0.0f64, |a, b| a.max(b));
-    
-    // Draw trade bubbles on top
+    // Draw trade markers on top of the line
     for trade in &trades_in_window {
         let x = ((trade.timestamp_ms - time_start) as f64 / window_ms as f64 * (chart_width - 1) as f64) as usize;
         let y = ((max_price - trade.price) / price_range * (chart_height - 1) as f64) as usize;
@@ -866,128 +868,103 @@ fn render_price_chart(f: &mut Frame, area: Rect, trade_history: &TradeHistory) {
         let x = x.min(chart_width - 1);
         let y = y.min(chart_height - 1);
         
-        // Determine bubble character based on size
-        let qty_ratio = if max_qty > 0.0 { trade.quantity / max_qty } else { 0.5 };
-        let bubble_char = if qty_ratio > 0.6 {
-            '●'
-        } else if qty_ratio > 0.2 {
-            '•'
+        // Size based on quantity relative to max
+        let qty_ratio = if max_volume > 0.0 { trade.quantity / max_volume } else { 0.5 };
+        let marker = if qty_ratio > 0.5 { '●' } else if qty_ratio > 0.1 { '◉' } else { '○' };
+        
+        let color = if trade.is_buy {
+            Color::Rgb(50, 255, 100)  // Bright green
         } else {
-            '·'
+            Color::Rgb(255, 80, 80)   // Bright red
         };
         
-        // Color based on buy/sell with intensity
-        let (base_r, base_g, base_b) = if trade.is_buy {
-            (50u8, 255u8, 50u8) // Green for buy
-        } else {
-            (255u8, 50u8, 50u8) // Red for sell
-        };
-        
-        // Increase intensity for larger trades
-        let intensity = 0.6 + qty_ratio * 0.4;
-        let r = (base_r as f64 * intensity).min(255.0) as u8;
-        let g = (base_g as f64 * intensity).min(255.0) as u8;
-        let b = (base_b as f64 * intensity).min(255.0) as u8;
-        
-        grid[y][x] = (bubble_char, Color::Rgb(r, g, b));
+        grid[y][x] = (marker, color);
     }
     
-    // Render Y-axis (price labels)
-    let y_axis_area = Rect::new(inner.x, inner.y, y_axis_width, chart_area.height);
+    // === RENDER Y-AXIS ===
+    let y_axis_x = inner.x;
     for row in 0..chart_height {
         let price = max_price - (row as f64 / (chart_height - 1).max(1) as f64) * price_range;
+        // Show labels at top, middle, and bottom
         let label = if row == 0 || row == chart_height - 1 || row == chart_height / 2 {
-            format!("{:>9.2}", price)
+            format!("{:>10.2}", price)
         } else {
             " ".repeat(y_axis_width as usize)
         };
-        let label_para = Paragraph::new(label)
-            .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(label_para, Rect::new(y_axis_area.x, y_axis_area.y + row as u16, y_axis_width, 1));
+        let label_para = Paragraph::new(label).style(Style::default().fg(Color::DarkGray));
+        f.render_widget(label_para, Rect::new(y_axis_x, inner.y + row as u16, y_axis_width, 1));
     }
     
-    // Render X-axis (time labels)
-    let x_axis_y = inner.y + inner.height - x_axis_height;
-    let time_labels = format!(
-        "{:<10}{:^width$}{:>10}",
-        "-60s",
-        "-30s", 
-        "now",
-        width = (chart_width - 20).max(0)
-    );
-    let x_axis_para = Paragraph::new(time_labels)
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(x_axis_para, Rect::new(chart_area.x, x_axis_y, chart_area.width, 1));
-    
-    // Render the chart grid
+    // === RENDER PRICE CHART GRID ===
+    let chart_x = inner.x + y_axis_width;
     for (row_idx, row) in grid.iter().enumerate() {
+        let spans: Vec<Span> = row.iter()
+            .map(|&(ch, color)| Span::styled(ch.to_string(), Style::default().fg(color)))
+            .collect();
+        let line = Line::from(spans);
+        f.render_widget(
+            Paragraph::new(line),
+            Rect::new(chart_x, inner.y + row_idx as u16, chart_width as u16, 1)
+        );
+    }
+    
+    // === RENDER VOLUME BARS ===
+    let volume_y = inner.y + price_chart_height;
+    
+    // Draw a separator line
+    let separator = "─".repeat(chart_width);
+    f.render_widget(
+        Paragraph::new(separator).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(chart_x, volume_y, chart_width as u16, 1)
+    );
+    
+    // Volume bars (remaining height - 1 for separator)
+    let vol_bar_height = (volume_height - 1) as usize;
+    for row in 0..vol_bar_height {
         let mut spans: Vec<Span> = Vec::new();
         
-        for &(ch, color) in row {
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(color)
-            ));
+        for x in 0..chart_width {
+            let buy_ratio = if max_volume > 0.0 { buy_volume[x] / max_volume } else { 0.0 };
+            let sell_ratio = if max_volume > 0.0 { sell_volume[x] / max_volume } else { 0.0 };
+            
+            // Calculate which level this row represents (from bottom up)
+            let level = (vol_bar_height - 1 - row) as f64 / vol_bar_height as f64;
+            
+            let ch = if buy_ratio > 0.0 && buy_ratio >= level {
+                Span::styled("▄", Style::default().fg(Color::Rgb(50, 200, 50)))
+            } else if sell_ratio > 0.0 && sell_ratio >= level {
+                Span::styled("▄", Style::default().fg(Color::Rgb(200, 50, 50)))
+            } else {
+                Span::raw(" ")
+            };
+            spans.push(ch);
         }
         
         let line = Line::from(spans);
         f.render_widget(
             Paragraph::new(line),
-            Rect::new(chart_area.x, chart_area.y + row_idx as u16, chart_area.width, 1)
+            Rect::new(chart_x, volume_y + 1 + row as u16, chart_width as u16, 1)
         );
     }
-}
-
-fn render_profiling(f: &mut Frame, area: Rect, stats: &ProfilingStats, render_time_us: u64) {
-    let ws_parse = stats.get_avg(&stats.ws_parse_time, &stats.ws_parse_count);
-    let lock_acquire = stats.get_avg(&stats.lock_acquire_time, &stats.lock_acquire_count);
-    let ob_update = stats.get_avg(&stats.orderbook_update_time, &stats.orderbook_update_count);
-    let aggregation = stats.get_avg(&stats.aggregation_time, &stats.aggregation_count);
-    let processing = stats.get_avg(&stats.processing_latency, &stats.processing_count) / 1000.0;
-    let network_lat = stats.get_avg(&stats.network_latency, &stats.network_count);
     
-    let profiling_block = Block::default()
-        .title(" PROFILING STATISTICS ")
-        .title_style(Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT_COLOR));
+    // Volume axis label
+    let vol_label = "VOL";
+    f.render_widget(
+        Paragraph::new(vol_label).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(y_axis_x + y_axis_width - 4, volume_y + 1, 4, 1)
+    );
     
-    let inner = profiling_block.inner(area);
-    f.render_widget(profiling_block, area);
-    
-    let stats_lines = vec![
-        Line::from(vec![
-            Span::styled("├─ WS Parse:     ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} μs", ws_parse), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("├─ Lock Acquire: ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} μs", lock_acquire), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("├─ OB Update:    ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} μs", ob_update), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("├─ Aggregation:  ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} μs", aggregation), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("├─ Render:       ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} ms", render_time_us as f64 / 1000.0), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("├─ Processing:   ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:>8.1} ms", processing), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("└─ Network Lat:  ", Style::default().fg(Color::Rgb(255, 200, 0)).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{:>8.1} ms", network_lat), Style::default().fg(Color::Rgb(255, 200, 0)).add_modifier(Modifier::BOLD)),
-        ]),
-    ];
-    
-    let stats_para = Paragraph::new(stats_lines);
-    f.render_widget(stats_para, inner);
+    // === RENDER X-AXIS ===
+    let x_axis_y = inner.y + inner.height - x_axis_height;
+    let time_labels = format!(
+        "{:<12}{:^width$}{:>12}",
+        "-60s",
+        "-30s", 
+        "now",
+        width = chart_width.saturating_sub(24)
+    );
+    let x_axis_para = Paragraph::new(time_labels).style(Style::default().fg(Color::DarkGray));
+    f.render_widget(x_axis_para, Rect::new(chart_x, x_axis_y, chart_width as u16, 1));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
