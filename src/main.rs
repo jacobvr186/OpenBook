@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -230,6 +230,88 @@ impl OrderBook {
     }
 }
 
+// Aggregate trade from WebSocket
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+struct WsAggTrade {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time: u64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "a")]
+    agg_trade_id: u64,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    quantity: String,
+    #[serde(rename = "f")]
+    first_trade_id: u64,
+    #[serde(rename = "l")]
+    last_trade_id: u64,
+    #[serde(rename = "T")]
+    trade_time: u64,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
+}
+
+// Parsed trade for display
+#[derive(Clone, Debug)]
+struct Trade {
+    timestamp_ms: u64,
+    price: f64,
+    quantity: f64,
+    is_buy: bool,  // true = buyer was taker (market buy)
+}
+
+// Rolling window of price and trade history
+#[derive(Clone)]
+struct TradeHistory {
+    price_points: VecDeque<(u64, f64)>,  // (timestamp_ms, mid_price)
+    trades: VecDeque<Trade>,
+    window_ms: u64,  // Time window to keep (e.g., 60000 for 60s)
+}
+
+impl TradeHistory {
+    fn new(window_ms: u64) -> Self {
+        Self {
+            price_points: VecDeque::new(),
+            trades: VecDeque::new(),
+            window_ms,
+        }
+    }
+
+    fn add_price(&mut self, timestamp_ms: u64, price: f64) {
+        self.price_points.push_back((timestamp_ms, price));
+        self.cleanup(timestamp_ms);
+    }
+
+    fn add_trade(&mut self, trade: Trade) {
+        let timestamp = trade.timestamp_ms;
+        self.trades.push_back(trade);
+        self.cleanup(timestamp);
+    }
+
+    fn cleanup(&mut self, current_time_ms: u64) {
+        let cutoff = current_time_ms.saturating_sub(self.window_ms);
+        while let Some(&(ts, _)) = self.price_points.front() {
+            if ts < cutoff {
+                self.price_points.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some(trade) = self.trades.front() {
+            if trade.timestamp_ms < cutoff {
+                self.trades.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -264,7 +346,7 @@ const ASK_DIM: Color = Color::Rgb(80, 0, 0);
 const HEADER_COLOR: Color = Color::Yellow;
 const ACCENT_COLOR: Color = Color::Cyan;
 
-fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats) {
+fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats, trade_history: &TradeHistory) {
     let agg_start = Instant::now();
     
     // Calculate aggregated data
@@ -328,6 +410,7 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats) {
             Constraint::Min(12),     // Order book
             Constraint::Length(2),   // Summary
             Constraint::Length(1),   // Update ID
+            Constraint::Length(10),  // Price chart
             Constraint::Length(11),  // Profiling
             Constraint::Length(1),   // Footer
         ])
@@ -473,8 +556,11 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats) {
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(update_id_para, chunks[5]);
     
+    // Price chart with trade bubbles
+    render_price_chart(f, chunks[6], trade_history);
+    
     // Profiling stats
-    render_profiling(f, chunks[6], stats, app.render_time_us);
+    render_profiling(f, chunks[7], stats, app.render_time_us);
     
     // Footer
     let footer = Paragraph::new(format!(
@@ -483,7 +569,7 @@ fn ui(f: &mut Frame, app: &App, book: &OrderBook, stats: &ProfilingStats) {
     ))
     .style(Style::default().fg(Color::DarkGray))
     .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(footer, chunks[7]);
+    f.render_widget(footer, chunks[8]);
 }
 
 fn render_bids(f: &mut Frame, area: Rect, bids: &[(f64, f64)], cumulative: &[f64], max_cumulative: f64) {
@@ -659,6 +745,164 @@ fn render_asks(f: &mut Frame, area: Rect, asks: &[(f64, f64)], cumulative: &[f64
     }
 }
 
+fn render_price_chart(f: &mut Frame, area: Rect, trade_history: &TradeHistory) {
+    let chart_block = Block::default()
+        .title(" PRICE & TRADES ")
+        .title_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    
+    let inner = chart_block.inner(area);
+    f.render_widget(chart_block, area);
+    
+    if inner.width < 20 || inner.height < 3 {
+        return; // Too small to render
+    }
+    
+    let chart_width = inner.width as usize;
+    let chart_height = inner.height as usize;
+    
+    // Get current time
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    
+    // Find price range
+    let mut min_price = f64::MAX;
+    let mut max_price = f64::MIN;
+    
+    for &(_, price) in &trade_history.price_points {
+        min_price = min_price.min(price);
+        max_price = max_price.max(price);
+    }
+    for trade in &trade_history.trades {
+        min_price = min_price.min(trade.price);
+        max_price = max_price.max(trade.price);
+    }
+    
+    // Add padding to price range
+    if min_price == f64::MAX || max_price == f64::MIN {
+        // No data yet
+        let no_data = Paragraph::new("Waiting for data...")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(no_data, inner);
+        return;
+    }
+    
+    let price_range = max_price - min_price;
+    let padding = if price_range > 0.0 { price_range * 0.1 } else { 0.01 };
+    min_price -= padding;
+    max_price += padding;
+    let price_range = max_price - min_price;
+    
+    // Time range: last 60 seconds
+    let window_ms = trade_history.window_ms;
+    let time_start = now_ms.saturating_sub(window_ms);
+    
+    // Create a 2D grid for the chart
+    let mut grid: Vec<Vec<(char, Color)>> = vec![vec![(' ', Color::Reset); chart_width]; chart_height];
+    
+    // Draw price line
+    let mut last_x: Option<usize> = None;
+    let mut last_y: Option<usize> = None;
+    
+    for &(ts, price) in &trade_history.price_points {
+        if ts < time_start {
+            continue;
+        }
+        let x = ((ts - time_start) as f64 / window_ms as f64 * (chart_width - 1) as f64) as usize;
+        let y = ((max_price - price) / price_range * (chart_height - 1) as f64) as usize;
+        
+        let x = x.min(chart_width - 1);
+        let y = y.min(chart_height - 1);
+        
+        // Draw line connecting points
+        if let (Some(lx), Some(ly)) = (last_x, last_y) {
+            // Simple line drawing between points
+            let dx = x as i32 - lx as i32;
+            let dy = y as i32 - ly as i32;
+            let steps = dx.abs().max(dy.abs()).max(1);
+            
+            for i in 0..=steps {
+                let px = (lx as i32 + dx * i / steps) as usize;
+                let py = (ly as i32 + dy * i / steps) as usize;
+                if px < chart_width && py < chart_height {
+                    if grid[py][px].0 == ' ' {
+                        grid[py][px] = ('─', Color::Cyan);
+                    }
+                }
+            }
+        }
+        
+        grid[y][x] = ('●', Color::Cyan);
+        last_x = Some(x);
+        last_y = Some(y);
+    }
+    
+    // Find max trade quantity for intensity scaling
+    let max_qty = trade_history.trades.iter()
+        .map(|t| t.quantity)
+        .fold(0.0f64, |a, b| a.max(b));
+    
+    // Draw trade bubbles
+    for trade in &trade_history.trades {
+        if trade.timestamp_ms < time_start {
+            continue;
+        }
+        
+        let x = ((trade.timestamp_ms - time_start) as f64 / window_ms as f64 * (chart_width - 1) as f64) as usize;
+        let y = ((max_price - trade.price) / price_range * (chart_height - 1) as f64) as usize;
+        
+        let x = x.min(chart_width - 1);
+        let y = y.min(chart_height - 1);
+        
+        // Determine bubble character based on size
+        let qty_ratio = if max_qty > 0.0 { trade.quantity / max_qty } else { 0.5 };
+        let bubble_char = if qty_ratio > 0.7 {
+            '●'
+        } else if qty_ratio > 0.3 {
+            '•'
+        } else {
+            '·'
+        };
+        
+        // Determine color based on buy/sell with intensity
+        let (base_r, base_g, base_b) = if trade.is_buy {
+            (0u8, 180u8, 0u8) // Green for buy
+        } else {
+            (180u8, 0u8, 0u8) // Red for sell
+        };
+        
+        // Increase intensity for larger trades
+        let intensity = 0.5 + qty_ratio * 0.5;
+        let r = (base_r as f64 * intensity).min(255.0) as u8;
+        let g = (base_g as f64 * intensity).min(255.0) as u8;
+        let b = (base_b as f64 * intensity).min(255.0) as u8;
+        
+        grid[y][x] = (bubble_char, Color::Rgb(r, g, b));
+    }
+    
+    // Render the grid
+    for (row_idx, row) in grid.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        
+        for &(ch, color) in row {
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(color)
+            ));
+        }
+        
+        let line = Line::from(spans);
+        f.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, inner.y + row_idx as u16, inner.width, 1)
+        );
+    }
+}
+
 fn render_profiling(f: &mut Frame, area: Rect, stats: &ProfilingStats, render_time_us: u64) {
     let ws_parse = stats.get_avg(&stats.ws_parse_time, &stats.ws_parse_count);
     let lock_acquire = stats.get_avg(&stats.lock_acquire_time, &stats.lock_acquire_count);
@@ -744,9 +988,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let order_book_ws = Arc::clone(&order_book);
     let order_book_render = Arc::clone(&order_book);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(WsDepthUpdate, Instant)>();
+    // Trade history for chart (60 second window)
+    let trade_history = Arc::new(RwLock::new(TradeHistory::new(60_000)));
+    let trade_history_ws = Arc::clone(&trade_history);
+    let trade_history_render = Arc::clone(&trade_history);
 
-    let ws_url = format!("wss://fstream.binance.com/stream?streams={}@depth@100ms", symbol);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(WsDepthUpdate, Instant)>();
+    let (trade_tx, mut trade_rx) = tokio::sync::mpsc::unbounded_channel::<Trade>();
+
+    // Subscribe to both depth and aggTrade streams
+    let ws_url = format!(
+        "wss://fstream.binance.com/stream?streams={}@depth@100ms/{}@aggTrade",
+        symbol, symbol
+    );
 
     println!("\x1b[33mConnecting to WebSocket...\x1b[0m");
 
@@ -756,6 +1010,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\x1b[32mWebSocket connected! Buffering events...\x1b[0m");
 
     let tx_clone = tx.clone();
+    let trade_tx_clone = trade_tx.clone();
     let stats_ws = Arc::clone(&stats);
     tokio::spawn(async move {
         while let Some(msg_result) = read.next().await {
@@ -765,12 +1020,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let parse_start = Instant::now();
                     
                     if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(data) = wrapper.get("data") {
-                            if let Ok(update) = serde_json::from_value::<WsDepthUpdate>(data.clone()) {
-                                let parse_elapsed = parse_start.elapsed().as_micros() as u64;
-                                stats_ws.record(&stats_ws.ws_parse_time, &stats_ws.ws_parse_count, parse_elapsed);
-                                
-                                let _ = tx_clone.send((update, recv_time));
+                        // Check stream name to determine message type
+                        if let Some(stream) = wrapper.get("stream").and_then(|s| s.as_str()) {
+                            if let Some(data) = wrapper.get("data") {
+                                if stream.contains("@depth") {
+                                    // Depth update message
+                                    if let Ok(update) = serde_json::from_value::<WsDepthUpdate>(data.clone()) {
+                                        let parse_elapsed = parse_start.elapsed().as_micros() as u64;
+                                        stats_ws.record(&stats_ws.ws_parse_time, &stats_ws.ws_parse_count, parse_elapsed);
+                                        let _ = tx_clone.send((update, recv_time));
+                                    }
+                                } else if stream.contains("@aggTrade") {
+                                    // Aggregate trade message
+                                    if let Ok(agg_trade) = serde_json::from_value::<WsAggTrade>(data.clone()) {
+                                        if let (Ok(price), Ok(qty)) = (
+                                            agg_trade.price.parse::<f64>(),
+                                            agg_trade.quantity.parse::<f64>()
+                                        ) {
+                                            let trade = Trade {
+                                                timestamp_ms: agg_trade.trade_time,
+                                                price,
+                                                quantity: qty,
+                                                is_buy: !agg_trade.is_buyer_maker, // buyer was taker = market buy
+                                            };
+                                            let _ = trade_tx_clone.send(trade);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -949,12 +1225,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             stats_main.record(&stats_main.processing_latency, &stats_main.processing_count, processing_elapsed);
         }
 
+        // Process trade updates
+        while let Ok(trade) = trade_rx.try_recv() {
+            let mut history = trade_history_ws.write().await;
+            history.add_trade(trade);
+        }
+
         // Render at fixed interval
         if last_render.elapsed() >= render_interval {
             let render_start = Instant::now();
             let book = order_book_render.read().await;
-            terminal.draw(|f| ui(f, &app, &book, &stats))?;
+            
+            // Sample mid-price for chart
+            if let (Some((bid, _)), Some((ask, _))) = (book.best_bid(), book.best_ask()) {
+                let mid_price = (bid + ask) / 2.0;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let mut history = trade_history_render.write().await;
+                history.add_price(now_ms, mid_price);
+            }
+            
+            let history = trade_history_render.read().await;
+            terminal.draw(|f| ui(f, &app, &book, &stats, &history))?;
             drop(book);
+            drop(history);
             app.render_time_us = render_start.elapsed().as_micros() as u64;
             stats.record(&stats.render_time, &stats.render_count, app.render_time_us);
             last_render = Instant::now();
