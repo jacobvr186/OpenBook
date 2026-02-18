@@ -1,1 +1,17 @@
+# Build artifacts
 /target
+debug/
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock is intentional for binaries — keep it tracked

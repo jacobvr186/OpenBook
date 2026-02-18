@@ -2,6 +2,9 @@
 name = "cli_ob"
 version = "0.1.0"
 edition = "2021"
+description = "Real-time Binance Futures order book viewer in the terminal"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
