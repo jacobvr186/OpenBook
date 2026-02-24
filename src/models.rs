@@ -372,7 +372,7 @@ pub struct DepthSlice {
 
 /// Ring buffer of historical order book snapshots for heatmap rendering.
 pub struct DepthHistory {
-    pub slices: VecDeque<DepthSlice>,
+    pub slices: VecDeque<Arc<DepthSlice>>,
     pub max_slices: usize,
     pub sample_interval_ms: u64,
     pub last_sample_ms: u64,
@@ -389,27 +389,42 @@ impl DepthHistory {
     }
 
     pub fn push(&mut self, slice: DepthSlice) {
-        self.slices.push_back(slice);
+        self.slices.push_back(Arc::new(slice));
         while self.slices.len() > self.max_slices {
             self.slices.pop_front();
         }
     }
-}
 
-/// Build a DepthSlice from the current OrderBook state.
-pub fn build_snapshot_from_book(book: &OrderBook, now_ms: u64) -> DepthSlice {
-    let mut levels: Vec<(f64, f64)> = Vec::with_capacity(book.bids.len() + book.asks.len());
-    for (price, &qty) in &book.bids {
-        levels.push((price.0, qty));
-    }
-    let bids_len = levels.len();
-    for (price, &qty) in &book.asks {
-        levels.push((price.0, qty));
-    }
-    DepthSlice {
-        timestamp_ms: now_ms,
-        levels,
-        bids_len,
+    pub fn push_from_book(&mut self, book: &OrderBook, now_ms: u64) {
+        let mut levels = if self.slices.len() >= self.max_slices {
+            self.slices
+                .pop_front()
+                .and_then(|old| Arc::try_unwrap(old).ok())
+                .map(|mut old| {
+                    old.levels.clear();
+                    old.levels
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let needed = book.bids.len() + book.asks.len();
+        if levels.capacity() < needed {
+            levels.reserve(needed - levels.capacity());
+        }
+        for (price, &qty) in &book.bids {
+            levels.push((price.0, qty));
+        }
+        let bids_len = levels.len();
+        for (price, &qty) in &book.asks {
+            levels.push((price.0, qty));
+        }
+        self.push(DepthSlice {
+            timestamp_ms: now_ms,
+            levels,
+            bids_len,
+        });
     }
 }
 
@@ -428,8 +443,11 @@ pub struct SharedState {
     pub snapshot_depth_slice_epoch: u64,
     pub snapshot_fill_kill_epoch: u64,
     pub snapshot_cumulative_epoch: u64,
+    pub snapshot_book_epoch: u64,
+    pub snapshot_bids: Arc<Vec<(f64, f64)>>,
+    pub snapshot_asks: Arc<Vec<(f64, f64)>>,
     pub snapshot_trades: Arc<Vec<(u64, f64, f64, bool)>>,
-    pub snapshot_depth_slices: Arc<Vec<DepthSlice>>,
+    pub snapshot_depth_slices: Arc<Vec<Arc<DepthSlice>>>,
     pub snapshot_fill_kill_series: Arc<Vec<FillKillSample>>,
     pub snapshot_cumulative_series: Arc<Vec<CumulativeSample>>,
     pub connected: bool,
@@ -455,6 +473,9 @@ impl SharedState {
             snapshot_depth_slice_epoch: u64::MAX,
             snapshot_fill_kill_epoch: u64::MAX,
             snapshot_cumulative_epoch: u64::MAX,
+            snapshot_book_epoch: u64::MAX,
+            snapshot_bids: Arc::new(Vec::new()),
+            snapshot_asks: Arc::new(Vec::new()),
             snapshot_trades: Arc::new(Vec::new()),
             snapshot_depth_slices: Arc::new(Vec::new()),
             snapshot_fill_kill_series: Arc::new(Vec::new()),

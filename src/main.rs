@@ -3,6 +3,10 @@ mod models;
 mod ui;
 mod workspace;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
 use models::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +19,16 @@ const DEFAULT_PRICE_DECIMALS: usize = 1;
 const MAX_PRICE_DECIMALS: usize = 8;
 
 fn main() -> eframe::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = {
+        let output_file = format!("dhat-heap-{}.json", std::process::id());
+        eprintln!(
+            "dhat: heap profiling enabled, output file will be '{}' on clean exit",
+            output_file
+        );
+        dhat::Profiler::builder().file_name(output_file).build()
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -607,8 +621,12 @@ async fn ws_loop(
                 if now_ms.saturating_sub(state.depth_history.last_sample_ms)
                     >= state.depth_history.sample_interval_ms
                 {
-                    let slice = build_snapshot_from_book(&state.order_book, now_ms);
-                    state.depth_history.push(slice);
+                    let SharedState {
+                        order_book,
+                        depth_history,
+                        ..
+                    } = &mut *state;
+                    depth_history.push_from_book(order_book, now_ms);
                     state.depth_slice_epoch = state.depth_slice_epoch.wrapping_add(1);
                     state.depth_history.last_sample_ms = now_ms;
                 }

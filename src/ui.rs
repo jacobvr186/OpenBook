@@ -1457,7 +1457,7 @@ impl OrderBookApp {
 
         // Aggregate into buckets
         let mut bid_buckets: BTreeMap<OrderedFloat<f64>, f64> = BTreeMap::new();
-        for &(price, qty) in &state.bids {
+        for &(price, qty) in state.bids.iter() {
             let bucket = (price / bucket_size).floor() * bucket_size;
             *bid_buckets.entry(OrderedFloat(bucket)).or_insert(0.0) += qty;
         }
@@ -1469,7 +1469,7 @@ impl OrderBookApp {
             .collect();
 
         let mut ask_buckets: BTreeMap<OrderedFloat<f64>, f64> = BTreeMap::new();
-        for &(price, qty) in &state.asks {
+        for &(price, qty) in state.asks.iter() {
             let bucket = (price / bucket_size).floor() * bucket_size;
             *ask_buckets.entry(OrderedFloat(bucket)).or_insert(0.0) += qty;
         }
@@ -2999,8 +2999,8 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 // A cloneable snapshot of the shared state for the UI to consume.
 #[derive(Clone)]
 pub struct StateSnapshot {
-    pub bids: Vec<(f64, f64)>,
-    pub asks: Vec<(f64, f64)>,
+    pub bids: Arc<Vec<(f64, f64)>>,
+    pub asks: Arc<Vec<(f64, f64)>>,
     pub depth_slice_epoch: u64,
     pub trade_epoch: u64,
     pub fill_kill_epoch: u64,
@@ -3015,7 +3015,7 @@ pub struct StateSnapshot {
     pub book_bid_count: usize,
     pub book_ask_count: usize,
     pub trades: Arc<Vec<(u64, f64, f64, bool)>>, // (timestamp, price, qty, is_buy)
-    pub depth_slices: Arc<Vec<DepthSlice>>,
+    pub depth_slices: Arc<Vec<Arc<DepthSlice>>>,
     pub fill_kill_series: Arc<Vec<FillKillSample>>,
     pub cumulative_series: Arc<Vec<CumulativeSample>>,
     pub fill_kill_kpis: FillKillKpis,
@@ -3045,23 +3045,37 @@ impl SharedState {
             .order_book
             .estimate_market_impact(impact_notional, false, mid);
 
-        // Collect top levels for the UI
-        let bids: Vec<(f64, f64)> = self
-            .order_book
-            .bids
-            .iter()
-            .rev()
-            .map(|(p, q)| (p.0, *q))
-            .collect();
-        let asks: Vec<(f64, f64)> = self
-            .order_book
-            .asks
-            .iter()
-            .map(|(p, q)| (p.0, *q))
-            .collect();
+        if self.snapshot_book_epoch != self.depth_epoch {
+            self.snapshot_bids = Arc::new(
+                self.order_book
+                    .bids
+                    .iter()
+                    .rev()
+                    .map(|(p, q)| (p.0, *q))
+                    .collect(),
+            );
+            self.snapshot_asks = Arc::new(
+                self.order_book
+                    .asks
+                    .iter()
+                    .map(|(p, q)| (p.0, *q))
+                    .collect(),
+            );
+            self.snapshot_book_epoch = self.depth_epoch;
+        }
 
-        let total_bid: f64 = bids.iter().take(DEPTH_LEVELS).map(|(_, q)| *q).sum();
-        let total_ask: f64 = asks.iter().take(DEPTH_LEVELS).map(|(_, q)| *q).sum();
+        let total_bid: f64 = self
+            .snapshot_bids
+            .iter()
+            .take(DEPTH_LEVELS)
+            .map(|(_, q)| *q)
+            .sum();
+        let total_ask: f64 = self
+            .snapshot_asks
+            .iter()
+            .take(DEPTH_LEVELS)
+            .map(|(_, q)| *q)
+            .sum();
         let imbalance = if total_bid + total_ask > 0.0 {
             ((total_bid - total_ask) / (total_bid + total_ask)) * 100.0
         } else {
@@ -3108,8 +3122,8 @@ impl SharedState {
         let fill_kill_kpis = self.micro_metrics.kpi_snapshot();
 
         StateSnapshot {
-            bids,
-            asks,
+            bids: Arc::clone(&self.snapshot_bids),
+            asks: Arc::clone(&self.snapshot_asks),
             depth_slice_epoch: self.depth_slice_epoch,
             trade_epoch: self.trade_epoch,
             fill_kill_epoch: self.fill_kill_epoch,

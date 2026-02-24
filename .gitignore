@@ -2,6 +2,8 @@
 /target
 debug/
 *.pdb
+dhat-heap-*.json
+dhat-*.svg
 
 # IDE
 .vscode/
@@ -24,5 +26,6 @@ AGENTS.md
 PLAN.md
 to_do.md
 INVESTIGATION.md
+HANDOFF.md
 
 # Cargo lock is intentional for binaries — keep it tracked

@@ -6,6 +6,10 @@ description = "Real-time Binance Futures order book viewer with egui GUI"
 license = "MIT"
 readme = "README.md"
 
+[features]
+default = []
+dhat-heap = ["dep:dhat"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
@@ -16,6 +20,7 @@ ordered-float = "4.0"
 reqwest = { version = "0.11", features = ["json", "native-tls"] }
 eframe = { version = "0.33", features = ["persistence"] }
 egui_tiles = { version = "0.14", features = ["serde"] }
+dhat = { version = "0.3", optional = true }
 
 [profile.release]
 opt-level = 3
